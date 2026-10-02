@@ -26,6 +26,7 @@ var (
 	styleMuted  = lipgloss.NewStyle().Foreground(colMuted)
 	styleAccent = lipgloss.NewStyle().Foreground(colGreen)
 	styleBold   = lipgloss.NewStyle().Foreground(colText).Bold(true)
+	styleErr    = lipgloss.NewStyle().Foreground(lipgloss.Color(colVizHigh))
 )
 
 // fit truncates s to w cells and pads it with spaces so it is exactly w wide.
@@ -63,11 +64,16 @@ func spread(left, right string, w int) string {
 }
 
 // panel draws a rounded box of exactly w x h with a title in the top border.
-func panel(title string, body []string, w, h int) string {
+// The focused panel gets an accent-colored border.
+func panel(title string, body []string, w, h int, focused bool) string {
 	if w < 4 || h < 2 {
 		return ""
 	}
-	border := lipgloss.NewStyle().Foreground(colBorder)
+	bc := colBorder
+	if focused {
+		bc = colGreen
+	}
+	border := lipgloss.NewStyle().Foreground(bc)
 	titleSt := lipgloss.NewStyle().Foreground(colGreen).Bold(true)
 
 	title = ansi.Truncate(title, w-6, "…")
@@ -86,3 +92,20 @@ func panel(title string, body []string, w, h int) string {
 }
 
 func clamp(v, lo, hi int) int { return max(lo, min(v, hi)) }
+
+// wrap word-wraps a message to w cells in the given style, one string per line.
+func wrap(s string, st lipgloss.Style, w int) []string {
+	return strings.Split(st.Width(max(w, 1)).Render(s), "\n")
+}
+
+// follow returns the scroll offset that keeps cursor inside a window of
+// `visible` rows.
+func follow(cursor, offset, visible int) int {
+	switch {
+	case visible <= 0, cursor < offset:
+		return max(cursor, 0)
+	case cursor >= offset+visible:
+		return cursor - visible + 1
+	}
+	return offset
+}

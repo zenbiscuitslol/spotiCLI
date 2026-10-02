@@ -27,8 +27,9 @@ func newVisualizer() *visualizer {
 	return &visualizer{rng: rand.New(rand.NewSource(7))}
 }
 
-// Step advances the simulation by dt seconds.
-func (v *visualizer) Step(dt float64) {
+// Step advances the simulation by dt seconds. While inactive (paused or
+// idle) the bars fall back to zero.
+func (v *visualizer) Step(dt float64, active bool) {
 	v.t += dt
 	// ~120 BPM kick drum envelope.
 	beat := math.Pow(math.Max(0, math.Sin(v.t*2*math.Pi*2)), 6)
@@ -39,6 +40,9 @@ func (v *visualizer) Step(dt float64) {
 		kick := beat * 0.5 * math.Pow(1-p, 2.5)
 		jitter := v.rng.Float64() * 0.1 * (1 - p*0.5)
 		target := math.Min(base*wob+kick+jitter, 1)
+		if !active {
+			target = 0
+		}
 		if target > v.bands[i] {
 			v.bands[i] += (target - v.bands[i]) * 0.6 // fast attack
 		} else {

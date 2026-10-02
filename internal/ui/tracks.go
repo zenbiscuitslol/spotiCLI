@@ -14,11 +14,27 @@ func fmtDur(d time.Duration) string {
 	return fmt.Sprintf("%d:%02d", s/60, s%60)
 }
 
-// tracksView renders the track table for the selected playlist.
+// tracksView renders the track table for the opened playlist.
 func (m Model) tracksView(w, h int) string {
 	inner := w - 2
+	focused := m.focus == paneTracks
 
-	// Column widths: fixed #, time; the rest split between title/artist/album.
+	if m.open < 0 {
+		return panel("Tracks", []string{styleMuted.Render(" Select a playlist and press enter")}, w, h, focused)
+	}
+	pl := m.playlists[m.open]
+	title := fmt.Sprintf("%s · %d tracks", ansi.Truncate(pl.Name, max(inner-20, 8), "…"), pl.Tracks)
+
+	switch {
+	case m.trErr != "":
+		return panel(title, wrap(m.trErr, styleErr, inner), w, h, focused)
+	case m.trLoading:
+		return panel(title, []string{styleMuted.Render(" Loading tracks…")}, w, h, focused)
+	case len(m.tracks) == 0:
+		return panel(title, []string{styleMuted.Render(" No playable tracks")}, w, h, focused)
+	}
+
+	// Columns: fixed #, time; the rest split between title/artist/album.
 	const numW, timeW = 4, 6
 	rest := max(inner-numW-timeW-4, 6) // 4 single-space gutters
 	titleW := rest * 40 / 100
@@ -26,23 +42,27 @@ func (m Model) tracksView(w, h int) string {
 	albumW := rest - titleW - artistW
 
 	row := func(num, title, artist, album, dur string, st lipgloss.Style) string {
-		cells := []string{
+		cells := strings.Join([]string{
 			fit(num, numW), fit(title, titleW), fit(artist, artistW), fit(album, albumW),
-		}
-		return st.Render(strings.Join(cells, " ")) + " " + st.Render(fmt.Sprintf("%*s", timeW, dur))
+		}, " ")
+		return st.Render(cells + " " + fmt.Sprintf("%*s", timeW, dur))
 	}
 
-	head := styleMuted.Underline(true)
-	lines := []string{row("#", "Title", "Artist", "Album", "Time", head)}
-	for i, t := range m.tracks {
+	lines := []string{row("#", "Title", "Artist", "Album", "Time", styleMuted.Underline(true))}
+	end := min(m.trOffset+h-3, len(m.tracks))
+	for i := m.trOffset; i < end; i++ {
+		t := m.tracks[i]
 		st, num := styleText, fmt.Sprintf("%d", i+1)
-		if i == m.nowIdx {
+		if m.state != nil && m.state.Track.URI == t.URI {
 			st, num = styleAccent.Bold(true), "▶"
+			if !m.state.Playing {
+				num = "❚❚"
+			}
+		}
+		if focused && i == m.trCursor {
+			st = st.Background(colSelBg)
 		}
 		lines = append(lines, row(num, t.Title, t.Artist, t.Album, fmtDur(t.Duration), st))
 	}
-
-	pl := m.playlists[m.selected]
-	title := ansi.Truncate(pl.Name, max(inner-20, 8), "…")
-	return panel(fmt.Sprintf("%s · %d tracks", title, pl.Tracks), lines, w, h)
+	return panel(title, lines, w, h, focused)
 }

@@ -1,11 +1,12 @@
 module github.com/zenbiscuitslol/spotiCLI
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.5
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.8.0
+	golang.org/x/oauth2 v0.37.0
 )
 
 require (

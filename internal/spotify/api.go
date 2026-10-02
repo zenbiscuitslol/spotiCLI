@@ -1,0 +1,381 @@
+package spotify
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"image"
+	_ "image/jpeg" // register decoders for album art
+	_ "image/png"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const apiBase = "https://api.spotify.com/v1"
+
+// Client is an authenticated Spotify Web API client. Create one with Connect.
+type Client struct {
+	http *http.Client // adds and refreshes the OAuth token
+	base string       // API root; overridden in tests
+}
+
+// APIError is a non-2xx response from the Web API.
+type APIError struct {
+	Status     int
+	Message    string
+	Reason     string // e.g. NO_ACTIVE_DEVICE
+	RetryAfter time.Duration
+}
+
+func (e *APIError) Error() string {
+	msg := e.Message
+	if msg == "" {
+		msg = http.StatusText(e.Status)
+	}
+	if e.Status == http.StatusTooManyRequests && e.RetryAfter > 0 {
+		return fmt.Sprintf("rate limited by Spotify, retry in %ds", int(e.RetryAfter.Seconds()))
+	}
+	return fmt.Sprintf("spotify: %s (%d)", msg, e.Status)
+}
+
+// do performs a request. target may be a path ("/me/player") or a full URL
+// (the "next" link of a paged response). It returns the HTTP status; a 204
+// leaves out untouched.
+func (c *Client) do(ctx context.Context, method, target string, query url.Values, body, out any) (int, error) {
+	if !strings.HasPrefix(target, "http") {
+		target = c.base + target
+		if len(query) > 0 {
+			target += "?" + query.Encode()
+		}
+	}
+
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return 0, err
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, rdr)
+	if err != nil {
+		return 0, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		var eb struct {
+			Error struct {
+				Message string `json:"message"`
+				Reason  string `json:"reason"`
+			} `json:"error"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&eb)
+		ae := &APIError{Status: resp.StatusCode, Message: eb.Error.Message, Reason: eb.Error.Reason}
+		if s, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil {
+			ae.RetryAfter = time.Duration(s) * time.Second
+		}
+		return resp.StatusCode, ae
+	}
+	if resp.StatusCode == http.StatusNoContent || out == nil {
+		return resp.StatusCode, nil
+	}
+	return resp.StatusCode, json.NewDecoder(resp.Body).Decode(out)
+}
+
+type page[T any] struct {
+	Items []T    `json:"items"`
+	Next  string `json:"next"`
+}
+
+// fetchAll follows "next" links until there are none or limit items are held.
+func fetchAll[T any](ctx context.Context, c *Client, path string, q url.Values, limit int) ([]T, error) {
+	var all []T
+	next := path
+	for next != "" && len(all) < limit {
+		var p page[T]
+		if _, err := c.do(ctx, http.MethodGet, next, q, nil, &p); err != nil {
+			return all, err
+		}
+		all = append(all, p.Items...)
+		next, q = p.Next, nil
+	}
+	return all, nil
+}
+
+// --- JSON shapes -----------------------------------------------------------
+
+type apiTrack struct {
+	URI        string `json:"uri"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	IsLocal    bool   `json:"is_local"`
+	DurationMs int    `json:"duration_ms"`
+	Artists    []struct {
+		Name string `json:"name"`
+	} `json:"artists"`
+	Album struct {
+		Name   string `json:"name"`
+		Images []struct {
+			URL   string `json:"url"`
+			Width int    `json:"width"`
+		} `json:"images"`
+	} `json:"album"`
+}
+
+// toTrack converts to a Track; ok is false for items we can't play (nulls,
+// local files, podcast episodes).
+func (t *apiTrack) toTrack() (Track, bool) {
+	if t == nil || t.URI == "" || t.IsLocal || (t.Type != "" && t.Type != "track") {
+		return Track{}, false
+	}
+	names := make([]string, len(t.Artists))
+	for i, a := range t.Artists {
+		names[i] = a.Name
+	}
+	// Images come widest-first; take the smallest one that's still >= 300px.
+	img := ""
+	for _, i := range t.Album.Images {
+		if img == "" || i.Width >= 300 {
+			img = i.URL
+		}
+	}
+	return Track{
+		URI:      t.URI,
+		Title:    t.Name,
+		Artist:   strings.Join(names, ", "),
+		Album:    t.Album.Name,
+		Duration: time.Duration(t.DurationMs) * time.Millisecond,
+		ImageURL: img,
+	}, true
+}
+
+// --- Library ---------------------------------------------------------------
+
+const (
+	maxPlaylists = 500
+	maxTracks    = 500
+)
+
+// Playlists returns "Liked Songs" followed by the user's playlists.
+func (c *Client) Playlists(ctx context.Context) ([]Playlist, error) {
+	type apiPlaylist struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+		URI  string `json:"uri"`
+		// Feb 2026: "tracks" was renamed "items". Accept both.
+		Items  *struct{ Total int } `json:"items"`
+		Tracks *struct{ Total int } `json:"tracks"`
+	}
+	raw, err := fetchAll[apiPlaylist](ctx, c, "/me/playlists", url.Values{"limit": {"50"}}, maxPlaylists)
+	if err != nil {
+		return nil, err
+	}
+
+	var liked struct {
+		Total int `json:"total"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, "/me/tracks", url.Values{"limit": {"1"}}, nil, &liked); err != nil {
+		return nil, err
+	}
+
+	out := []Playlist{{ID: "liked", Name: "Liked Songs", Tracks: liked.Total, Liked: true}}
+	for _, p := range raw {
+		n := 0
+		switch {
+		case p.Items != nil:
+			n = p.Items.Total
+		case p.Tracks != nil:
+			n = p.Tracks.Total
+		}
+		out = append(out, Playlist{ID: p.ID, Name: p.Name, URI: p.URI, Tracks: n})
+	}
+	return out, nil
+}
+
+// Tracks returns the playable tracks of a playlist (first 500).
+func (c *Client) Tracks(ctx context.Context, pl Playlist) ([]Track, error) {
+	var tracks []Track
+	if pl.Liked {
+		raw, err := fetchAll[struct {
+			Track *apiTrack `json:"track"`
+		}](ctx, c, "/me/tracks", url.Values{"limit": {"50"}}, maxTracks)
+		if err != nil {
+			return nil, err
+		}
+		for _, it := range raw {
+			if t, ok := it.Track.toTrack(); ok {
+				tracks = append(tracks, t)
+			}
+		}
+		return tracks, nil
+	}
+
+	raw, err := fetchAll[struct {
+		Item  *apiTrack `json:"item"`  // current field name
+		Track *apiTrack `json:"track"` // pre-2026 name
+	}](ctx, c, "/playlists/"+url.PathEscape(pl.ID)+"/items", url.Values{"limit": {"50"}}, maxTracks)
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Status == http.StatusForbidden {
+		return nil, errors.New("Spotify only exposes tracks of playlists you own or collaborate on")
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, it := range raw {
+		t := it.Item
+		if t == nil {
+			t = it.Track
+		}
+		if tr, ok := t.toTrack(); ok {
+			tracks = append(tracks, tr)
+		}
+	}
+	return tracks, nil
+}
+
+// --- Playback --------------------------------------------------------------
+
+// Playback returns the current playback, or nil if nothing is active.
+func (c *Client) Playback(ctx context.Context) (*State, error) {
+	var raw struct {
+		IsPlaying  bool      `json:"is_playing"`
+		ProgressMs int       `json:"progress_ms"`
+		Shuffle    bool      `json:"shuffle_state"`
+		Repeat     string    `json:"repeat_state"`
+		Item       *apiTrack `json:"item"`
+		Device     struct {
+			Name          string `json:"name"`
+			VolumePercent int    `json:"volume_percent"`
+		} `json:"device"`
+	}
+	status, err := c.do(ctx, http.MethodGet, "/me/player", nil, nil, &raw)
+	if err != nil || status == http.StatusNoContent {
+		return nil, err
+	}
+	t, ok := raw.Item.toTrack()
+	if !ok {
+		return nil, nil
+	}
+	return &State{
+		Playing:    raw.IsPlaying,
+		Track:      t,
+		Progress:   time.Duration(raw.ProgressMs) * time.Millisecond,
+		Volume:     raw.Device.VolumePercent,
+		Shuffle:    raw.Shuffle,
+		Repeat:     raw.Repeat,
+		DeviceName: raw.Device.Name,
+	}, nil
+}
+
+// Play starts tracks[idx] in the context of pl. Playlists play via their
+// context URI so next/previous follow the playlist; Liked Songs has no
+// context, so up to 100 tracks starting at idx are queued instead.
+func (c *Client) Play(ctx context.Context, pl Playlist, tracks []Track, idx int) error {
+	if idx < 0 || idx >= len(tracks) {
+		return errors.New("no track selected")
+	}
+	body := map[string]any{}
+	if pl.Liked || pl.URI == "" {
+		var uris []string
+		for _, t := range tracks[idx:min(idx+100, len(tracks))] {
+			uris = append(uris, t.URI)
+		}
+		body["uris"] = uris
+	} else {
+		body["context_uri"] = pl.URI
+		body["offset"] = map[string]string{"uri": tracks[idx].URI}
+	}
+	return c.player(ctx, http.MethodPut, "/me/player/play", body)
+}
+
+func (c *Client) Resume(ctx context.Context) error {
+	return c.player(ctx, http.MethodPut, "/me/player/play", nil)
+}
+func (c *Client) Pause(ctx context.Context) error {
+	return c.player(ctx, http.MethodPut, "/me/player/pause", nil)
+}
+func (c *Client) Next(ctx context.Context) error {
+	return c.player(ctx, http.MethodPost, "/me/player/next", nil)
+}
+func (c *Client) Previous(ctx context.Context) error {
+	return c.player(ctx, http.MethodPost, "/me/player/previous", nil)
+}
+
+// player sends a playback command. If Spotify reports no active device, it
+// retries once on the first available device (which wakes that device up).
+func (c *Client) player(ctx context.Context, method, path string, body any) error {
+	_, err := c.do(ctx, method, path, nil, body, nil)
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Reason == "NO_ACTIVE_DEVICE" {
+		id, derr := c.pickDevice(ctx)
+		if derr != nil || id == "" {
+			return errors.New("no Spotify device found — open Spotify on a device first")
+		}
+		_, err = c.do(ctx, method, path, url.Values{"device_id": {id}}, body, nil)
+	}
+	return err
+}
+
+func (c *Client) pickDevice(ctx context.Context) (string, error) {
+	var res struct {
+		Devices []struct {
+			ID           string `json:"id"`
+			IsActive     bool   `json:"is_active"`
+			IsRestricted bool   `json:"is_restricted"`
+		} `json:"devices"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, "/me/player/devices", nil, nil, &res); err != nil {
+		return "", err
+	}
+	id := ""
+	for _, d := range res.Devices {
+		if d.IsRestricted || d.ID == "" {
+			continue
+		}
+		if d.IsActive {
+			return d.ID, nil
+		}
+		if id == "" {
+			id = d.ID
+		}
+	}
+	return id, nil
+}
+
+// --- Album art -------------------------------------------------------------
+
+var cdn = &http.Client{Timeout: 15 * time.Second}
+
+// Image downloads and decodes an image (album art lives on a public CDN, so
+// no auth header is sent).
+func (c *Client) Image(ctx context.Context, u string) (image.Image, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := cdn.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cover download: %s", resp.Status)
+	}
+	img, _, err := image.Decode(io.LimitReader(resp.Body, 8<<20))
+	return img, err
+}

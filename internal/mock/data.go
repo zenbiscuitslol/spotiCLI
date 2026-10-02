@@ -1,72 +1,147 @@
-// Package mock holds placeholder data so the UI can be designed before any
-// Spotify API calls exist. Replace these with real API results later.
+// Package mock is an in-memory stand-in for the Spotify client. It powers
+// `spotici --demo` and the UI tests, so the app can run without credentials.
 package mock
 
 import (
+	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"math"
+	"sync"
 	"time"
+
+	"github.com/zenbiscuitslol/spotiCLI/internal/spotify"
 )
 
-type Playlist struct {
-	Name   string
-	Tracks int
+const coverURL = "mock://cover"
+
+var playlistData = []struct {
+	name   string
+	tracks int
+}{
+	{"Liked Songs", 312}, {"Discover Weekly", 30}, {"Release Radar", 24},
+	{"Daily Mix 1", 50}, {"Daily Mix 2", 50}, {"Late Night Drive", 87},
+	{"Focus Flow", 120}, {"Gym Hype", 64}, {"Chill Lo-fi", 203},
+	{"Road Trip", 95}, {"Throwback 2000s", 140}, {"Indie Mix", 58},
+	{"Jazz Classics", 76}, {"Study Beats", 160}, {"Sunday Morning", 41},
+	{"Acoustic Evenings", 33},
 }
 
-type Track struct {
-	Title    string
-	Artist   string
-	Album    string
-	Duration time.Duration
+// Backend implements ui.Backend with canned data and a simulated player.
+type Backend struct {
+	mu      sync.Mutex
+	queue   []spotify.Track
+	idx     int
+	active  bool
+	playing bool
+	base    time.Duration // progress at `since`
+	since   time.Time
 }
 
-func Playlists() []Playlist {
-	return []Playlist{
-		{"Liked Songs", 312},
-		{"Discover Weekly", 30},
-		{"Release Radar", 24},
-		{"Daily Mix 1", 50},
-		{"Daily Mix 2", 50},
-		{"Late Night Drive", 87},
-		{"Focus Flow", 120},
-		{"Gym Hype", 64},
-		{"Chill Lo-fi", 203},
-		{"Road Trip", 95},
-		{"Throwback 2000s", 140},
-		{"Indie Mix", 58},
-		{"Jazz Classics", 76},
-		{"Study Beats", 160},
-		{"Sunday Morning", 41},
-		{"Acoustic Evenings", 33},
+func New() *Backend { return &Backend{} }
+
+func (b *Backend) Playlists(context.Context) ([]spotify.Playlist, error) {
+	out := make([]spotify.Playlist, len(playlistData))
+	for i, p := range playlistData {
+		out[i] = spotify.Playlist{
+			ID: fmt.Sprintf("mock:%d", i), URI: fmt.Sprintf("mock:%d", i),
+			Name: p.name, Tracks: p.tracks, Liked: i == 0,
+		}
 	}
+	return out, nil
 }
 
-func Tracks() []Track {
+func (b *Backend) Tracks(context.Context, spotify.Playlist) ([]spotify.Track, error) {
+	return Tracks(), nil
+}
+
+func (b *Backend) progress() time.Duration {
+	if b.playing {
+		return b.base + time.Since(b.since)
+	}
+	return b.base
+}
+
+func (b *Backend) Playback(context.Context) (*spotify.State, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.active {
+		return nil, nil
+	}
+	return &spotify.State{
+		Playing: b.playing, Track: b.queue[b.idx], Progress: b.progress(),
+		Volume: 70, Repeat: "off", DeviceName: "Demo device",
+	}, nil
+}
+
+func (b *Backend) Play(_ context.Context, _ spotify.Playlist, tracks []spotify.Track, idx int) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.queue, b.idx, b.active, b.playing = tracks, idx, true, true
+	b.base, b.since = 0, time.Now()
+	return nil
+}
+
+func (b *Backend) Resume(context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.active && !b.playing {
+		b.playing, b.since = true, time.Now()
+	}
+	return nil
+}
+
+func (b *Backend) Pause(context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.playing {
+		b.base, b.playing = b.progress(), false
+	}
+	return nil
+}
+
+func (b *Backend) skip(delta int) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.active {
+		b.idx = (b.idx + delta + len(b.queue)) % len(b.queue)
+		b.base, b.since = 0, time.Now()
+	}
+	return nil
+}
+
+func (b *Backend) Next(context.Context) error     { return b.skip(1) }
+func (b *Backend) Previous(context.Context) error { return b.skip(-1) }
+
+func (b *Backend) Image(context.Context, string) (image.Image, error) { return Cover(), nil }
+
+// Tracks returns sample tracks.
+func Tracks() []spotify.Track {
 	m := func(min, sec int) time.Duration {
 		return time.Duration(min)*time.Minute + time.Duration(sec)*time.Second
 	}
-	return []Track{
-		{"Neon Horizons", "The Midnight Cartel", "Afterglow", m(3, 42)},
-		{"Paper Planes in July", "Wren & the Tides", "Small Hours", m(4, 8)},
-		{"Static Bloom", "Halcyon Arcade", "Static Bloom", m(3, 15)},
-		{"Run Slow", "Marlowe Park", "Run Slow", m(2, 58)},
-		{"Glass Cathedral", "Ember Choir", "Vespers", m(5, 21)},
-		{"Honey Overdrive", "Velvet Static", "Honey Overdrive", m(3, 33)},
-		{"Low Tide Letters", "Saoirse Vale", "Low Tide", m(4, 47)},
-		{"Concrete Garden", "North of Nowhere", "Concrete Garden", m(3, 5)},
-		{"Satellites", "Juno Lark", "Orbit", m(3, 51)},
-		{"Fever Dream Motel", "The Paper Kites Club", "Vacancy", m(4, 12)},
-		{"Slow Burn", "Marlowe Park", "Run Slow", m(3, 27)},
-		{"Moonlit Arcade", "Halcyon Arcade", "Static Bloom", m(2, 49)},
-		{"Wildflower Radio", "Wren & the Tides", "Small Hours", m(3, 38)},
-		{"Telescope", "Juno Lark", "Orbit", m(4, 2)},
-		{"Golden Hour Static", "Velvet Static", "Honey Overdrive", m(3, 19)},
-		{"Undertow", "Ember Choir", "Vespers", m(5, 44)},
-		{"City of Lanterns", "North of Nowhere", "Concrete Garden", m(3, 56)},
-		{"Last Train Home", "Saoirse Vale", "Low Tide", m(4, 30)},
-		{"Daydream Parade", "The Midnight Cartel", "Afterglow", m(3, 11)},
-		{"Soft Machines", "Halcyon Arcade", "Static Bloom", m(4, 6)},
+	return []spotify.Track{
+		{URI: "mock:track:1", Title: "Neon Horizons", Artist: "The Midnight Cartel", Album: "Afterglow", Duration: m(3, 42), ImageURL: coverURL},
+		{URI: "mock:track:2", Title: "Paper Planes in July", Artist: "Wren & the Tides", Album: "Small Hours", Duration: m(4, 8), ImageURL: coverURL},
+		{URI: "mock:track:3", Title: "Static Bloom", Artist: "Halcyon Arcade", Album: "Static Bloom", Duration: m(3, 15), ImageURL: coverURL},
+		{URI: "mock:track:4", Title: "Run Slow", Artist: "Marlowe Park", Album: "Run Slow", Duration: m(2, 58), ImageURL: coverURL},
+		{URI: "mock:track:5", Title: "Glass Cathedral", Artist: "Ember Choir", Album: "Vespers", Duration: m(5, 21), ImageURL: coverURL},
+		{URI: "mock:track:6", Title: "Honey Overdrive", Artist: "Velvet Static", Album: "Honey Overdrive", Duration: m(3, 33), ImageURL: coverURL},
+		{URI: "mock:track:7", Title: "Low Tide Letters", Artist: "Saoirse Vale", Album: "Low Tide", Duration: m(4, 47), ImageURL: coverURL},
+		{URI: "mock:track:8", Title: "Concrete Garden", Artist: "North of Nowhere", Album: "Concrete Garden", Duration: m(3, 5), ImageURL: coverURL},
+		{URI: "mock:track:9", Title: "Satellites", Artist: "Juno Lark", Album: "Orbit", Duration: m(3, 51), ImageURL: coverURL},
+		{URI: "mock:track:10", Title: "Fever Dream Motel", Artist: "The Paper Kites Club", Album: "Vacancy", Duration: m(4, 12), ImageURL: coverURL},
+		{URI: "mock:track:11", Title: "Slow Burn", Artist: "Marlowe Park", Album: "Run Slow", Duration: m(3, 27), ImageURL: coverURL},
+		{URI: "mock:track:12", Title: "Moonlit Arcade", Artist: "Halcyon Arcade", Album: "Static Bloom", Duration: m(2, 49), ImageURL: coverURL},
+		{URI: "mock:track:13", Title: "Wildflower Radio", Artist: "Wren & the Tides", Album: "Small Hours", Duration: m(3, 38), ImageURL: coverURL},
+		{URI: "mock:track:14", Title: "Telescope", Artist: "Juno Lark", Album: "Orbit", Duration: m(4, 2), ImageURL: coverURL},
+		{URI: "mock:track:15", Title: "Golden Hour Static", Artist: "Velvet Static", Album: "Honey Overdrive", Duration: m(3, 19), ImageURL: coverURL},
+		{URI: "mock:track:16", Title: "Undertow", Artist: "Ember Choir", Album: "Vespers", Duration: m(5, 44), ImageURL: coverURL},
+		{URI: "mock:track:17", Title: "City of Lanterns", Artist: "North of Nowhere", Album: "Concrete Garden", Duration: m(3, 56), ImageURL: coverURL},
+		{URI: "mock:track:18", Title: "Last Train Home", Artist: "Saoirse Vale", Album: "Low Tide", Duration: m(4, 30), ImageURL: coverURL},
+		{URI: "mock:track:19", Title: "Daydream Parade", Artist: "The Midnight Cartel", Album: "Afterglow", Duration: m(3, 11), ImageURL: coverURL},
+		{URI: "mock:track:20", Title: "Soft Machines", Artist: "Halcyon Arcade", Album: "Static Bloom", Duration: m(4, 6), ImageURL: coverURL},
 	}
 }
 
